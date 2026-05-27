@@ -60,7 +60,7 @@ pip install bleak matplotlib numpy
 ### 3. Download the script
 
 ```bash
-git clone https://github.com/<your-repo>/VSH101-ECG.git
+git clone https://github.com/imleonchuang/VSH101-ECG.git
 cd VSH101-ECG
 ```
 
