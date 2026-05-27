@@ -31,6 +31,13 @@ A Python application for real-time ECG acquisition and visualization from the **
 | **Status Bar** | Live packet count and streaming rate |
 
 ---
+## Demo
+
+> Real-time ECG acquisition from VSH101 via PC Bluetooth — 6-minute
+
+[![IMAGE ALT TEXT](http://img.youtube.com/vi/ZE4aCbcqkPk/0.jpg)](https://www.youtube.com/watch?v=ZE4aCbcqkPk "VSH101 Real-Time ECG Monitor (PC Bluetooth)")
+
+---
 
 ## Hardware Requirements
 
