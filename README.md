@@ -17,6 +17,21 @@ A Python application for real-time ECG acquisition and visualization from the **
 
 ---
 
+## Screenshot
+
+> Real-time ECG acquisition from VSH101 via PC Bluetooth — 10-second scrolling waveform at 500 Hz, with Heart Rate trend and vital signs panel.
+
+![VSH101 Real-Time ECG Monitor](VSH101_BLE.png)
+
+| Panel | Description |
+|-------|-------------|
+| **ECG Waveform** | 10-second scrolling display, ch0 filtered, 500 Hz, ±2 mV range |
+| **Heart Rate Trend** | Live HR history (bpm) updated every 200 ms |
+| **Status Panel** | HR, Temperature, Battery SOC, RR Interval, packet rate |
+| **Status Bar** | Live packet count and streaming rate |
+
+---
+
 ## Hardware Requirements
 
 | Item | Details |
@@ -535,6 +550,7 @@ Run the terminal as Administrator, or ensure no other app (e.g. the VSH101 mobil
 VSH101-ECG/
 ├── VSH101_BLE.py       # Main application
 └── README.md           # This file
+└── VSH101_BLE.png      # ECG screenshot
 ```
 
 ---
