@@ -15,10 +15,10 @@ Install:
     pip install bleak matplotlib numpy
 
 Usage:
-    python vsh101_ble.py                           # auto-scan and choose/connect
-    python vsh101_ble.py --mac CC:CC:CC:90:BA:2B   # direct connect via specify MAC
-    python vsh101_ble.py --scan-only               # scan and list VSH101 devices
-    python vsh101_ble.py --demo                    # simulate without hardware
+    python VSH101_BLE.py                           # auto-scan and choose/connect
+    python VSH101_BLE.py --mac CC:CC:CC:90:BA:2B   # direct connect via specify MAC
+    python VSH101_BLE.py --scan-only               # scan and list VSH101 devices
+    python VSH101_BLE.py --demo                    # simulate without hardware
 """
 
 import asyncio
@@ -59,7 +59,7 @@ DISPLAY_SAMPLES  = int(SAMPLE_RATE * DISPLAY_SECONDS)
 
 
 # ─────────────────────────────────────────────────────────────────
-# Time-stamped Log Helper (HH:MM:SS.mmm format)
+# Time-stamped Log Helper (時分秒毫秒格式化)
 # ─────────────────────────────────────────────────────────────────
 def _log_msg(msg: str):
     """Prints a message prefixed with current time as [HH:MM:SS.mmm]."""
@@ -158,15 +158,28 @@ def parse_vsc(raw: bytes, vsc_type: int = 1) -> dict:
 
     info_off = ECG_BYTES[vsc_type]
     if len(payload) >= info_off + INFO_BYTES:
-        info = struct.unpack_from(f"<{INFO_BYTES // 4}i", payload, info_off)
+        # Official doc: all INFO fields are float32 (except G-sensor points at end)
+        # Use "<42f" to unpack all 42 fields as float32
+        info = struct.unpack_from(f"<{INFO_BYTES // 4}f", payload, info_off)
         if len(info) >= 10:
-            result["temp"]     = info[1] / 10.0
-            hr = info[2]
-            result["hr"]       = hr if 20 < hr < 300 else 0
-            result["lead_off"] = info[3]
-            result["battery"]  = info[7]
-            rr = info[9]
-            result["rr_ms"]    = rr if rr > 0 else 0
+            # [1] Temperature — float in °C (no scaling needed)
+            temp = info[2]
+            result["temp"] = round(temp, 1) if 10.0 < temp < 50.0 else 0.0
+
+            # [2] Heart Rate — float bpm
+            hr = int(round(info[3]))
+            result["hr"] = hr if 20 < hr < 300 else 0
+
+            # [3] Lead-off flag — 0.0 = electrodes OK, non-zero = lead off
+            result["lead_off"] = 1 if info[4] != 0.0 else 0
+
+            # [7] Battery SOC — float %
+            bat = int(round(info[8]))
+            result["battery"] = bat if 0 <= bat <= 100 else 0
+
+            # [9] RR interval — float in ms
+            rr = info[13]
+            result["rr_ms"] = round(rr) if rr > 0 else 0
 
     result["valid"] = True
     return result
@@ -272,7 +285,7 @@ class BLEManager:
         self._pending_buf.clear()
         self._pending_len  = ack_len
 
-        if "VSC RD" not in label: # suppress verbose TX log during high-frequency READ stream
+        if "VSC RD" not in label: # 減少串流時不必要的詳細日誌，保持畫面乾淨
             _log_msg(f"[TX] {label}  ({len(data)}B): {data[:8].hex()} ...")
         
         try:
@@ -723,10 +736,10 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python vsh101_ble.py
-  python vsh101_ble.py --mac CC:CC:CC:90:BA:2B
-  python vsh101_ble.py --scan-only
-  python vsh101_ble.py --demo
+  python VSH101_BLE.py
+  python VSH101_BLE.py --mac CC:CC:CC:90:BA:2B
+  python VSH101_BLE.py --scan-only
+  python VSH101_BLE.py --demo
         """
     )
     parser.add_argument("--mac",          default=DEFAULT_MAC,
@@ -762,10 +775,10 @@ Examples:
         plotter.start()
         return
 
-    # ── Device selection and connection logic ────
+    # ── 裝置選擇與連線邏輯 ───────────────────────────────────────────
     target_mac = args.mac
     if not target_mac:
-        # No --mac specified on command line — trigger auto-scan
+        # 如果命令列沒有指定 --mac，則啟動自動掃描
         devices = asyncio.run(_scan(args.scan_timeout))
         if not devices:
             _log_msg("\n[WARN] No VSH101 device found. Ensure device is powered on.")
@@ -806,7 +819,7 @@ Examples:
         _log_msg("[FATAL] BLE connection failed.")
         _log_msg("  - Is VSH101 powered on?  (hold button 5 s, green LED blinks)")
         _log_msg("  - Is PC Bluetooth enabled?")
-        _log_msg("  - Verify MAC with:  python vsh101_ble.py --scan-only")
+        _log_msg("  - Verify MAC with:  python VSH101_BLE.py --scan-only")
         return
 
     _log_msg("[MAIN] Opening ECG window...")
