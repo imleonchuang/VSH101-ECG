@@ -59,7 +59,7 @@ DISPLAY_SAMPLES  = int(SAMPLE_RATE * DISPLAY_SECONDS)
 
 
 # ─────────────────────────────────────────────────────────────────
-# Time-stamped Log Helper (時分秒毫秒格式化)
+# Time-stamped Log Helper (HH:MM:SS.mmm format)
 # ─────────────────────────────────────────────────────────────────
 def _log_msg(msg: str):
     """Prints a message prefixed with current time as [HH:MM:SS.mmm]."""
@@ -285,7 +285,7 @@ class BLEManager:
         self._pending_buf.clear()
         self._pending_len  = ack_len
 
-        if "VSC RD" not in label: # 減少串流時不必要的詳細日誌，保持畫面乾淨
+        if "VSC RD" not in label: # suppress verbose TX log during high-frequency READ stream
             _log_msg(f"[TX] {label}  ({len(data)}B): {data[:8].hex()} ...")
         
         try:
@@ -775,10 +775,10 @@ Examples:
         plotter.start()
         return
 
-    # ── 裝置選擇與連線邏輯 ───────────────────────────────────────────
+    # ── Device selection and connection logic ────
     target_mac = args.mac
     if not target_mac:
-        # 如果命令列沒有指定 --mac，則啟動自動掃描
+        # No --mac specified on command line — trigger auto-scan
         devices = asyncio.run(_scan(args.scan_timeout))
         if not devices:
             _log_msg("\n[WARN] No VSH101 device found. Ensure device is powered on.")
