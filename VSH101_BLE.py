@@ -55,6 +55,7 @@ DISPLAY_SECONDS  = 10
 SAMPLE_RATE      = 500.0    # Hz
 SAMPLES_PER_PKT  = 100      # samples per channel per packet (200 ms)
 PACKET_INTERVAL  = 0.200    # seconds
+VSC_POLL_INTERVAL = 0.050   # retry empty replies without advancing the index
 DISPLAY_SAMPLES  = int(SAMPLE_RATE * DISPLAY_SECONDS)
 
 
@@ -73,6 +74,7 @@ def _log_msg(msg: str):
 # VSH101 BLE packet builder  (direct — no VSM004 wrapper)
 # ─────────────────────────────────────────────────────────────────
 _PARAM_PAD = bytes(16)
+VSC_READ_COMMAND_SIZE = 8
 
 def _chk(data: bytes) -> int:
     return sum(data) % 256
@@ -106,15 +108,19 @@ def cmd_vsc_type_set(vsc_type: int) -> bytes:
 def cmd_vsc_read(index: int, vsc_type: int = 1) -> bytes:
     """
     VSC Mode Read packet.
-    param[0:4] = index (LE uint32), param[4] = 0x01 (channel flag).
+    param[0:4] = index (LE uint32), param[4:8] = VSC type (LE uint32).
     MISO = 968 (Type-0) or 568 (Type-1).
     """
     miso = 968 if vsc_type == 0 else 568
     param = bytearray(16)
     struct.pack_into("<I", param, 0, index & 0xFFFFFFFF)
-    param[4] = 0x01
-    return _vsh_pkt(0x6A, 0xC2, 0x6A, mosi_len=0, miso_len=miso,
-                    param=bytes(param))
+    struct.pack_into("<I", param, 4, vsc_type)
+    # FW 315 validates MOSI even though index and type use the fixed parameters.
+    # Include the declared command bytes so packet length and checksum agree.
+    command_data = bytes(VSC_READ_COMMAND_SIZE)
+    return _vsh_pkt(0x6A, 0xC2, 0x6A,
+                    mosi_len=VSC_READ_COMMAND_SIZE, miso_len=miso,
+                    param=bytes(param), cmd_data=command_data)
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -125,7 +131,13 @@ INFO_BYTES   = 168                 # 42 × int32
 RESP_HDR_LEN = 8
 RESP_TOTAL   = {0: RESP_HDR_LEN + 968,    # 976
                 1: RESP_HDR_LEN + 568}    # 576
-IDX_INVALID  = 0x8000              # device returns this when data not ready
+IDX_INVALID  = 8000                # decimal 8000 (0x1F40), data not ready
+VSC_INDEX_COUNT = 1000
+ACK_READY    = 0x41
+VSC_COMMAND  = 0x6A
+BLE_GROUP    = 0xC2
+VERSION_VALUE_LEN = 4
+VERSION_MODEL_LEN = 16
 
 def parse_vsc(raw: bytes, vsc_type: int = 1) -> dict:
     """
@@ -135,26 +147,35 @@ def parse_vsc(raw: bytes, vsc_type: int = 1) -> dict:
               "ecg": [], "hr": 0, "temp": 0.0,
               "battery": 0, "rr_ms": 0, "lead_off": 0, "index": -1}
 
-    if len(raw) < RESP_TOTAL[vsc_type]:
+    # Validate the complete frame before interpreting ECG or metadata.
+    if len(raw) < RESP_HDR_LEN:
+        return result
+    if raw[0] != VSC_COMMAND or raw[1] != BLE_GROUP:
+        return result
+    if raw[2] != ACK_READY:
+        return result
+    checksum = (sum(raw) - raw[3]) % 256
+    if checksum != raw[3]:
         return result
 
-    if raw[0] != 0x6A or raw[1] != 0xC2:
-        return result
-
-    if raw[2] != 0x41:          # Ack byte: 'A'=ready, 'N'=not ready
-        result["not_ready"] = True
-        return result
-
-    idx = struct.unpack_from("<H", raw, 4)[0]
+    idx, payload_len = struct.unpack_from("<HH", raw, 4)
     result["index"] = idx
-    if idx >= IDX_INVALID:
+    if len(raw) != RESP_HDR_LEN + payload_len:
+        return result
+    if idx == IDX_INVALID:
         result["not_ready"] = True
         return result
+    if idx >= VSC_INDEX_COUNT or len(raw) != RESP_TOTAL[vsc_type]:
+        return result
 
-    payload  = raw[RESP_HDR_LEN:]
-    ecg_n    = ECG_BYTES[vsc_type] // 4
-    ecg_all  = struct.unpack_from(f"<{ecg_n}f", payload, 0)
-    result["ecg"] = list(ecg_all[:SAMPLES_PER_PKT])
+    payload = raw[RESP_HDR_LEN:]
+    ecg_n = ECG_BYTES[vsc_type] // 4
+    ecg_all = struct.unpack_from(f"<{ecg_n}f", payload, 0)
+    if vsc_type == 0:
+        # Type-0 stores alternating raw and filtered channel samples.
+        result["ecg"] = list(ecg_all[1::2])
+    else:
+        result["ecg"] = list(ecg_all)
 
     info_off = ECG_BYTES[vsc_type]
     if len(payload) >= info_off + INFO_BYTES:
@@ -204,7 +225,6 @@ class BLEManager:
         self.status = {"hr": "--", "temp": "--", "battery": "--",
                        "rr": "--", "pkt_s": 0.0, "lead_off": 0}
 
-        self._rx_buf     = bytearray()
         self._last_pkt_t = time.time()
 
         self._pending_len   = None
@@ -215,35 +235,22 @@ class BLEManager:
         self._loop: asyncio.AbstractEventLoop = None
 
     def _on_notify(self, _sender, data: bytearray):
-        if self._pending_len is not None:
-            self._pending_buf.extend(data)
-            if len(self._pending_buf) >= self._pending_len:
-                raw = bytes(self._pending_buf[:self._pending_len])
-                self._pending_data = raw
-                self._pending_len  = None
-                self._pending_event.set()
-                if len(raw) >= 2 and raw[0] == 0x6A and raw[1] == 0xC2:
-                    self._process(raw)
+        # Only the active request owns incoming fragments; late replies are ignored.
+        if self._pending_len is None or self._pending_event.is_set():
+            return
+        self._pending_buf.extend(data)
+        if len(self._pending_buf) < RESP_HDR_LEN:
             return
 
-        self._rx_buf.extend(data)
-        expected = RESP_TOTAL[self.vsc_type]
+        payload_len = struct.unpack_from("<H", self._pending_buf, 6)[0]
+        frame_len = RESP_HDR_LEN + payload_len
+        if frame_len <= self._pending_len and len(self._pending_buf) < frame_len:
+            return
 
-        while len(self._rx_buf) >= expected:
-            sync = 0
-            while sync < len(self._rx_buf) - 1:
-                if self._rx_buf[sync] == 0x6A and self._rx_buf[sync + 1] == 0xC2:
-                    break
-                sync += 1
-            if sync > 0:
-                self._rx_buf = self._rx_buf[sync:]
-
-            if len(self._rx_buf) < expected:
-                break
-
-            pkt = bytes(self._rx_buf[:expected])
-            self._rx_buf = self._rx_buf[expected:]
-            self._process(pkt)
+        # Short ACK/NACK frames finish immediately; validation runs in the caller.
+        self._pending_data = bytes(self._pending_buf)
+        self._pending_len = None
+        self._pending_event.set()
 
     def _process(self, raw: bytes):
         p = parse_vsc(raw, self.vsc_type)
@@ -278,7 +285,7 @@ class BLEManager:
         await self.client.write_gatt_char(BLE_WRITE_UUID, data, response=True)
 
     async def _write_req_ack(self, label: str, data: bytes,
-                             ack_len: int = 16, timeout: float = 3.0,
+                             ack_len: int = RESP_HDR_LEN, timeout: float = 3.0,
                              print_ack: bool = True) -> tuple[bool, bytes | None]:
         self._pending_event.clear()
         self._pending_data = None
@@ -303,12 +310,27 @@ class BLEManager:
         self._pending_len = None
 
         if not ok or self._pending_data is None:
-            _log_msg(f"[ACK] {label}  FAIL — Timeout ({timeout}s), no Notify received")
+            received = len(self._pending_buf)
+            preview = self._pending_buf[:RESP_HDR_LEN].hex()
+            _log_msg(f"[BLE][RX] {label} timeout ({timeout}s), "
+                     f"received={received}B, header={preview}")
             return False, None
 
         ack = self._pending_data
 
-        if len(ack) >= 3 and ack[2] == 0x41:
+        # Match command, declared length and checksum before accepting a reply.
+        payload_len = struct.unpack_from("<H", ack, 6)[0]
+        frame_len = RESP_HDR_LEN + payload_len
+        checksum = (sum(ack) - ack[3]) % 256
+        if (ack[:2] != data[:2] or len(ack) != frame_len or
+                frame_len > ack_len or checksum != ack[3]):
+            _log_msg(f"[BLE][RX] {label} invalid response: {ack.hex()}")
+            return False, ack
+        if ack[2] == ACK_READY and data[0] != VSC_COMMAND and len(ack) != ack_len:
+            _log_msg(f"[BLE][RX] {label} unexpected length: {len(ack)}B")
+            return False, ack
+
+        if ack[2] == ACK_READY:
             if print_ack:
                 pcode  = f"{ack[0]:02X}"
                 group  = f"{ack[1]:02X}"
@@ -332,8 +354,12 @@ class BLEManager:
         if not ok or ack is None or len(ack) < 8:
             return ""
 
-        payload = ack[8:]
-        ver_str = payload.rstrip(b"\x00").decode("ascii", errors="replace").strip()
+        # The firmware number is uint32 LE, followed by a fixed model string.
+        version = struct.unpack_from("<I", ack, RESP_HDR_LEN)[0]
+        model_start = RESP_HDR_LEN + VERSION_VALUE_LEN
+        model_end = model_start + VERSION_MODEL_LEN
+        model = ack[model_start:model_end].split(b"\x00", 1)[0].decode("ascii")
+        ver_str = f"{version} ({model})"
         return ver_str
 
     async def _async_connect(self):
@@ -400,7 +426,7 @@ class BLEManager:
                 if _first_read:
                     _log_msg(f"[TX] VSC RD Idx={self._vsc_index}  ({len(pkt)}B): {pkt[:8].hex()} ...  sent OK")
 
-                ok, _ = await self._write_req_ack(
+                ok, raw = await self._write_req_ack(
                     f"VSC RD Idx={self._vsc_index}",
                     pkt,
                     ack_len=READ_ACK_LEN,
@@ -414,10 +440,21 @@ class BLEManager:
                         _log_msg(f"[ACK] VSC RD Idx={self._vsc_index}  FAIL")
                     _first_read = False
 
-                if ok:
-                    self._vsc_index = (self._vsc_index + 1) % 1000
+                if not ok:
+                    _abort("VSC read failed — check the response log before restarting")
+                    break
+                packet = parse_vsc(raw, self.vsc_type)
+                if packet["not_ready"]:
+                    await asyncio.sleep(VSC_POLL_INTERVAL)
+                    continue
+                if not packet["valid"] or packet["index"] != self._vsc_index:
+                    _abort("Invalid ECG response or unexpected packet index")
+                    break
+                self._process(raw)
+                self._vsc_index = (self._vsc_index + 1) % VSC_INDEX_COUNT
             except Exception as e:
-                _log_msg(f"[VSC] Write error: {e}")
+                _abort(f"ECG read error: {e}")
+                break
 
         try:
             ok, _ = await self._write_req_ack(
